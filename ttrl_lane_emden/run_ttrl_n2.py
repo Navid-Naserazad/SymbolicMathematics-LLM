@@ -269,6 +269,22 @@ def print_certified(rows, label):
         print(f"      fitted={r['fitted_expr']} coeffs={r['coeffs']}")
         print(f"      tokens={r['tokens']}")
 
+def print_accuracy_diagnostics(verifier, fitted_expr, label=""):
+    """Pure evaluation – never affects training."""
+    if fitted_expr is None:
+        print(f"  [eval{label}] no fitted expression")
+        return
+    acc = verifier.evaluate_accuracy(fitted_expr)
+    print(f"  [eval{label}] max |error| on [0,4] = {acc['max_abs_error']:.3e}")
+    print(f"  [eval{label}] first-zero error     = {acc['first_zero_error']:.3e}"
+          f"  (approx ξ₁ = {acc['first_zero_approx']})")
+    print(f"  [eval{label}] absolute error table:")
+    for x, e in acc["abs_error_table"]:
+        print(f"      x={x:.1f}  |err|={e:.3e}")
+    print(f"  [eval{label}] relative error table:")
+    for x, e in acc["rel_error_table"]:
+        print(f"      x={x:.1f}  rel_err={e:.3e}")
+
 
 def log_certified_events(fout, rows, source, step=None):
     for r in rows:
@@ -381,6 +397,8 @@ def main():
     src_tokens = equation_to_tokens(env, input_problem.equation)
     verifier = LaneEmdenN2Verifier(
         env,
+        anchor_points=[0.05, 0.15, 0.40, 1.0, 2.0],
+        anchor_weights=[1.0, 1.0, 1.0, 0.7, 0.4],
         certify_ode_rel=a.certify_ode_rel, certify_ref_nrmse=a.certify_ref_nrmse,
         certify_anchor_rmse=a.certify_anchor_rmse,
         elite_ode_rel=a.elite_ode_rel, elite_ref_nrmse=a.elite_ref_nrmse,
@@ -409,6 +427,7 @@ def main():
     print(f'reward={g0.reward:.3f} certified={g0.certified_ivp} elite={g0.elite_eligible} ode={g0.ode_rel_mse:.3e} ref={g0.ref_nrmse:.3e}')
     print(f'expr={g0.expression}')
     print(f'fitted={g0.fitted_expression} coeffs={g0.fitted_coefficients}')
+    print_accuracy_diagnostics(verifier, g0.fitted_expression, label=" baseline")
 
     # Keep adaptation/search cache completely separate from held-out evaluation cache.
     train_cache = {}; eval_cache = {}; elites = []
@@ -528,6 +547,7 @@ def main():
 
         _, gz = greedy_eval(env, decoder, enc1, src_len_1, verifier, a.max_len)
         print(f"  greedy reward={gz.reward:.3f} certified={int(gz.certified_ivp)} elite={int(gz.elite_eligible)} ode={gz.ode_rel_mse:.2e} ref={gz.ref_nrmse:.2e} :: {gz.expression}")
+        print_accuracy_diagnostics(verifier, gz.fitted_expression, label=f" step {step}")
 
         ev=None
         if a.eval_rollouts>0 and a.eval_every>0 and (((step+1)%a.eval_every)==0):
@@ -564,6 +584,7 @@ def main():
         torch.save(decoder.state_dict(), a.save_decoder); print(f'saved_decoder={a.save_decoder}')
     print(f'budgets: search_verifier_calls={search_verifier_calls} heldout_eval_calls={heldout_eval_calls} diagnostic_greedy_calls={a.steps + 2}')
     print(f'result_log={a.save_jsonl}')
+    print_accuracy_diagnostics(verifier, gf.fitted_expression, label=" final")
 
 
 if __name__=='__main__':

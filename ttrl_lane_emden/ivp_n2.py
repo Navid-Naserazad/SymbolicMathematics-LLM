@@ -149,7 +149,7 @@ class LaneEmdenN2Verifier:
     def __init__(
         self,
         env,
-        x_anchor: float = 0.10,
+        x_anchor: float = 0.10,          # kept for backward compatibility (first point)
         x_max: float = 4.0,
         n_ode_points: int = 36,
         n_ref_points: int = 48,
@@ -161,6 +161,9 @@ class LaneEmdenN2Verifier:
         elite_anchor_rmse: float = 1e-2,
         max_coeffs: int = 2,
         candidate_timeout_s: float = 3.0,
+        # ---- new multi-anchor settings ----
+        anchor_points: Optional[Sequence[float]] = None,
+        anchor_weights: Optional[Sequence[float]] = None,
     ):
         self.env = env
         self.x = env.local_dict["x"]
@@ -175,27 +178,44 @@ class LaneEmdenN2Verifier:
         self.elite_ref_nrmse = float(elite_ref_nrmse)
         self.elite_anchor_rmse = float(elite_anchor_rmse)
         self.candidate_timeout_s = float(candidate_timeout_s)
-        self.reference = LaneEmdenN2Reference(x_min=x_anchor, x_max=x_max)
+        self.reference = LaneEmdenN2Reference(x_min=0.05, x_max=x_max)
 
-        # Use the denominator-cleared equation for both model input and numeric
-        # residual scoring.  This removes the explicit singular 2/x coefficient.
+        # ---------- multi-point anchor setup ----------
+        if anchor_points is None:
+            # Recommended default set (near-origin heavy)
+            self.anchor_x = np.array([0.05, 0.10, 0.20, 0.50, 1.00], dtype=np.float64)
+        else:
+            self.anchor_x = np.asarray(anchor_points, dtype=np.float64)
+
+        if anchor_weights is None:
+            # Higher weight near the origin
+            self.anchor_w = np.exp(-self.anchor_x / 0.8)
+        else:
+            self.anchor_w = np.asarray(anchor_weights, dtype=np.float64)
+        self.anchor_w = self.anchor_w / np.sum(self.anchor_w)   # normalise
+
+        # Pre-compute reference values at the anchor points
+        self.anchor_y  = self.reference.y(self.anchor_x)
+        self.anchor_yp = self.reference.yp(self.anchor_x)
+
+        # Keep the old single-point target for any legacy code that might still look at it
+        self.anchor_target = np.array([
+            float(self.reference.y([self.x_anchor])[0]),
+            float(self.reference.yp([self.x_anchor])[0]),
+        ], dtype=np.float64)
+
+        # ---------- rest of the original initialisation ----------
         y = self.f(self.x)
         yp = sp.diff(y, self.x)
         ypp = sp.diff(y, self.x, 2)
         self.input_terms = (self.x * ypp, 2 * yp, self.x * y**2)
         self.equation = sp.Add(*self.input_terms)
 
-        # Disjoint deterministic grids: odd/even offsets prevent the fitting grid
-        # from being identical to the certification/reference grid.
         self.ode_x = np.linspace(self.x_anchor, self.x_max, n_ode_points, dtype=np.float64)
         step = (self.x_max - self.x_anchor) / max(n_ref_points, 1)
         self.ref_x = np.linspace(self.x_anchor + 0.37 * step, self.x_max - 0.19 * step,
                                  n_ref_points, dtype=np.float64)
         self.ref_y = self.reference.y(self.ref_x)
-        self.anchor_target = np.array([
-            float(self.reference.y([self.x_anchor])[0]),
-            float(self.reference.yp([self.x_anchor])[0]),
-        ], dtype=np.float64)
 
     def _fit_coefficients(self, hyp: sp.Expr):
         coeffs = _coefficient_symbols(self.env, hyp)
@@ -205,21 +225,28 @@ class LaneEmdenN2Verifier:
             return hyp, {}, self._anchor_rmse(hyp)
 
         yp = sp.diff(hyp, self.x)
-        fn_y = sp.lambdify([self.x] + coeffs, hyp, modules=["numpy"])
-        fn_yp = sp.lambdify([self.x] + coeffs, yp, modules=["numpy"])
+        fn_y  = sp.lambdify([self.x] + coeffs, hyp, modules=["numpy"])
+        fn_yp = sp.lambdify([self.x] + coeffs, yp,  modules=["numpy"])
 
+        n_pts = len(self.anchor_x)
+        # residual vector length = 2 * number of anchors  (y and y' at each point)
         def residual(cvals):
             try:
-                yv = complex(fn_y(self.x_anchor, *cvals))
-                dv = complex(fn_yp(self.x_anchor, *cvals))
-                if (not np.isfinite(yv.real) or not np.isfinite(yv.imag) or
+                res = np.empty(2 * n_pts, dtype=np.float64)
+                for i, xi in enumerate(self.anchor_x):
+                    yv = complex(fn_y(xi, *cvals))
+                    dv = complex(fn_yp(xi, *cvals))
+                    if (not np.isfinite(yv.real) or not np.isfinite(yv.imag) or
                         not np.isfinite(dv.real) or not np.isfinite(dv.imag) or
                         abs(yv.imag) > 1e-7 or abs(dv.imag) > 1e-7):
-                    return np.array([1e4, 1e4], dtype=np.float64)
-                return np.array([yv.real - self.anchor_target[0], dv.real - self.anchor_target[1]],
-                                dtype=np.float64)
+                        return np.full(2 * n_pts, 1e4, dtype=np.float64)
+                    # weighted residuals
+                    w = math.sqrt(self.anchor_w[i])
+                    res[2*i]     = w * (yv.real - self.anchor_y[i])
+                    res[2*i + 1] = w * (dv.real - self.anchor_yp[i])
+                return res
             except Exception:
-                return np.array([1e4, 1e4], dtype=np.float64)
+                return np.full(2 * n_pts, 1e4, dtype=np.float64)
 
         starts = [
             np.zeros(len(coeffs)),
@@ -228,6 +255,7 @@ class LaneEmdenN2Verifier:
         ]
         if len(coeffs) == 2:
             starts += [np.array([1.0, -1.0]), np.array([-1.0, 1.0])]
+
         best = None
         for s in starts:
             try:
@@ -235,7 +263,7 @@ class LaneEmdenN2Verifier:
                     residual,
                     s,
                     bounds=(-20.0, 20.0),
-                    max_nfev=80,
+                    max_nfev=120,          # a bit more budget for multi-point
                     xtol=1e-9,
                     ftol=1e-9,
                     gtol=1e-9,
@@ -245,6 +273,7 @@ class LaneEmdenN2Verifier:
                     best = (err, out.x.copy())
             except Exception:
                 continue
+
         if best is None:
             raise ValueError("coefficient fitting failed")
 
@@ -253,17 +282,93 @@ class LaneEmdenN2Verifier:
         return fitted, {str(c): float(v) for c, v in coeff_map.items()}, float(best[0])
 
     def _anchor_rmse(self, fitted: sp.Expr):
+        """RMSE of (y, y') over the multi-point anchor set (weighted)."""
         yp = sp.diff(fitted, self.x)
         try:
-            fy = sp.lambdify(self.x, fitted, modules=["numpy"])
-            fyp = sp.lambdify(self.x, yp, modules=["numpy"])
-            vals = np.array([complex(fy(self.x_anchor)), complex(fyp(self.x_anchor))])
-            if not np.all(np.isfinite(vals)) or np.max(np.abs(vals.imag)) > 1e-7:
-                return 1e6
-            err = vals.real - self.anchor_target
-            return float(np.sqrt(np.mean(err * err)))
+            fy  = sp.lambdify(self.x, fitted, modules=["numpy"])
+            fyp = sp.lambdify(self.x, yp,     modules=["numpy"])
+
+            errs = []
+            for i, xi in enumerate(self.anchor_x):
+                yv = complex(fy(xi))
+                dv = complex(fyp(xi))
+                if (not np.isfinite(yv.real) or not np.isfinite(dv.real) or
+                    abs(yv.imag) > 1e-7 or abs(dv.imag) > 1e-7):
+                    return 1e6
+                w = self.anchor_w[i]
+                errs.append(w * (yv.real - self.anchor_y[i])**2)
+                errs.append(w * (dv.real - self.anchor_yp[i])**2)
+            return float(np.sqrt(np.mean(errs)))
         except Exception:
             return 1e6
+
+    def evaluate_accuracy(self, fitted: sp.Expr, grid=None):
+        """
+        Pure evaluation diagnostics (never used for reward / training).
+        Returns a dict with absolute/relative error tables, max abs error,
+        and first-zero error versus the high-accuracy reference.
+        """
+        if fitted is None:
+            return {
+                "abs_error_table": [],
+                "rel_error_table": [],
+                "max_abs_error": 1e6,
+                "first_zero_approx": None,
+                "first_zero_error": 1e6,
+            }
+
+        if grid is None:
+            grid = np.array([0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0], dtype=np.float64)
+
+        ref_y = self.reference.y(grid)
+        try:
+            fy = sp.lambdify(self.x, fitted, modules=["numpy"])
+            pred = np.asarray(fy(grid), dtype=np.complex128)
+            if pred.ndim == 0:
+                pred = np.full(grid.shape, pred, dtype=np.complex128)
+            pred = np.broadcast_to(pred, grid.shape).real
+        except Exception:
+            return {
+                "abs_error_table": [],
+                "rel_error_table": [],
+                "max_abs_error": 1e6,
+                "first_zero_approx": None,
+                "first_zero_error": 1e6,
+            }
+
+        abs_err = np.abs(pred - ref_y)
+        rel_err = np.abs(pred - ref_y) / (np.abs(ref_y) + 1e-12)
+
+        abs_table = [(float(x), float(e)) for x, e in zip(grid, abs_err)]
+        rel_table = [(float(x), float(e)) for x, e in zip(grid, rel_err)]
+        max_abs = float(np.max(abs_err))
+
+        # First zero of the approximate solution
+        xi1_ref = 4.35287459595
+        try:
+            xs = np.linspace(0.1, 5.0, 2000)
+            ys = np.asarray(fy(xs), dtype=np.complex128).real
+            zero_idx = np.where(ys[:-1] * ys[1:] <= 0)[0]
+            if len(zero_idx) > 0:
+                i = zero_idx[0]
+                x0, x1 = xs[i], xs[i + 1]
+                y0, y1 = ys[i], ys[i + 1]
+                xi1_approx = x0 - y0 * (x1 - x0) / (y1 - y0 + 1e-30)
+                first_zero_err = abs(xi1_approx - xi1_ref)
+            else:
+                xi1_approx = None
+                first_zero_err = 1e6
+        except Exception:
+            xi1_approx = None
+            first_zero_err = 1e6
+
+        return {
+            "abs_error_table": abs_table,
+            "rel_error_table": rel_table,
+            "max_abs_error": max_abs,
+            "first_zero_approx": float(xi1_approx) if xi1_approx is not None else None,
+            "first_zero_error": float(first_zero_err),
+        }
 
     def _metrics(self, fitted: sp.Expr):
         yp = sp.diff(fitted, self.x)

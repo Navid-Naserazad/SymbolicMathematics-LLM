@@ -270,14 +270,14 @@ def print_certified(rows, label):
         print(f"      tokens={r['tokens']}")
 
 def print_accuracy_diagnostics(verifier, fitted_expr, label=""):
-    """Pure evaluation â€“ never affects training."""
+    """Pure evaluation – never affects training."""
     if fitted_expr is None:
         print(f"  [eval{label}] no fitted expression")
         return
     acc = verifier.evaluate_accuracy(fitted_expr)
     print(f"  [eval{label}] max |error| on [0.5,{verifier.x_max:g}] = {acc['max_abs_error']:.3e}")
     print(f"  [eval{label}] first-zero error     = {acc['first_zero_error']:.3e}"
-          f"  (approx Î¾â‚ = {acc['first_zero_approx']})")
+          f"  (approx ξ₁ = {acc['first_zero_approx']})")
     print(f"  [eval{label}] absolute error table:")
     for x, e in acc["abs_error_table"]:
         print(f"      x={x:.1f}  |err|={e:.3e}")
@@ -439,7 +439,7 @@ def main():
         restore_rng_state(eval_rng)
         heldout_eval_calls += int(a.eval_rollouts)
         print(f"\n[baseline fresh] certified={ev['certified']}/{ev['n']} ({100*ev['certified_rate']:.2f}%) elite={ev['elite_eligible']}/{ev['n']} best={ev['best_reward']:.3f} timeouts={ev['timeouts']}")
-        print_certified(ev['certified_candidates'], 'baseline fresh â€” held out, NOT replayed')
+        print_certified(ev['certified_candidates'], 'baseline fresh — held out, NOT replayed')
         fout.write(json.dumps({'event': 'baseline_eval', 'eval': ev})+'\n'); fout.flush()
         log_certified_events(fout, ev['certified_candidates'], 'baseline_fresh')
 
@@ -556,7 +556,7 @@ def main():
             restore_rng_state(eval_rng)
             heldout_eval_calls += int(a.eval_rollouts)
             print(f"  [fresh] certified={ev['certified']}/{ev['n']} ({100*ev['certified_rate']:.2f}%) elite={ev['elite_eligible']}/{ev['n']} ({100*ev['elite_rate']:.2f}%) best={ev['best_reward']:.3f} timeouts={ev['timeouts']} verify={ev['verification_s']:.1f}s")
-            print_certified(ev['certified_candidates'], f'fresh step {step} â€” held out, NOT replayed')
+            print_certified(ev['certified_candidates'], f'fresh step {step} — held out, NOT replayed')
             log_certified_events(fout, ev['certified_candidates'], 'fresh_eval', step)
 
         total=time.perf_counter()-tstep
